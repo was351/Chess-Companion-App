@@ -1,7 +1,8 @@
-# Board-App - Smart Chess Board Application
+# Board-App — Smart Chess Board Application
 
 ![Version](https://img.shields.io/badge/Version-0.1.0-blue)
 ![Platform](https://img.shields.io/badge/Platform-iOS%20%7C%20Android-green)
+![Architecture](https://img.shields.io/badge/Architecture-Full%20Stack-brightgreen)
 
 ---
 
@@ -99,6 +100,58 @@ sequenceDiagram
 
 Server-side **Stockfish** runs in separate **`engine-worker`** processes — not in the API. The Docker stack starts **3 workers by default** (up to **3 analyses in parallel**); each worker claims one job from the Redis queue at a time. Nimbus enqueues via `POST /engine/jobs` and streams eval over **SSE** (`GET /engine/jobs/{id}/events`). Job state lives on Redis **db 1** (`REDIS_ENGINE_URL`); friend games stay on **db 0** (`REDIS_URL`).
 
+### Queue Implementation Details
+
+The engine worker uses a **Redis LIST visibility-timeout queue pattern** for reliable job processing:
+
+**Queues (Redis LISTs):**
+- `engine:queue:ready` — Jobs waiting to be claimed
+- `engine:queue:processing` — Jobs claimed by a worker (visibility timeout: 60 sec)
+
+**Job State (Redis HASH):**
+- `engine:job:{job_id}` — Mutable job record with status, attempts, error, timestamps
+
+**Pub/Sub & Results:**
+- `engine:events:{job_id}` — SSE channel for live eval progress updates
+- Job result stored in `engine:job:{job_id}` hash on completion
+
+**Dead Letter Queue:**
+- `engine:dead:{job_id}` — Jobs that exceed max retry attempts (default 3)
+
+**Worker Lifecycle:**
+
+1. **Claim:** `BRPOPLPUSH engine:queue:ready → engine:queue:processing` + set `status=running, claimed_at`
+2. **Process:** Run Stockfish analysis via UCI engine; publish partial results to `engine:events:{job_id}` over SSE
+3. **Ack:** Remove job from processing list, set `status=done` on hash
+4. **Error/Retry:** On exception → `LREM` from processing → retry to ready (increment attempts) or move to DLQ if max attempts exceeded
+5. **Stale Recovery:** Background reclaimer thread checks processing list every 30 seconds; jobs older than visibility timeout are re-queued or DLQ'd
+
+**Example Job Lifecycle:**
+
+```
+enqueue_ready(job_123)
+  → LPUSH engine:queue:ready "job_123"
+
+claim_job(block_timeout=5)
+  → BRPOPLPUSH ready → processing → job_123
+  → HSET engine:job:job_123 {status: running, claimed_at: 2025-05-30T12:00:00Z}
+
+_process_job(job_123)
+  → Get job record from engine:job:job_123 hash
+  → Run Stockfish UCI analysis
+  → For each evaluation → publish to engine:events:job_123 (SSE)
+  → On success → set_job_result(status=done)
+
+ack_job(job_123)
+  → LREM engine:queue:processing 1 "job_123"
+  → Nimbus receives final SSE event, closes /engine/jobs/job_123/events
+
+On failure → retry_or_dlq(job_123, error=...)
+  → LREM from processing
+  → If attempts < 3 → LPUSH to ready (return to step 2)
+  → If attempts >= 3 → HSET status=failed, SET engine:dead:job_123
+```
+
 | Use case | Nimbus screen | API request |
 |----------|---------------|-------------|
 | Live eval while playing a friend | `friendGame.tsx` | `fen` + depth 12, `profile: play` |
@@ -112,6 +165,18 @@ cd Board-Backend && poetry run python -m engine_worker
 ```
 
 Or use Docker: `./scripts/docker-stack.sh up` (3× `engine-worker` by default — override with `--engine-workers N`; see [docker/stack.yml](docker/stack.yml)).
+
+**Queue Configuration** (see [`Board-Backend/engine/config.py`](Board-Backend/engine/config.py)):
+
+- `CLAIM_BLOCK_TIMEOUT_SEC` — How long `BRPOPLPUSH` blocks waiting for jobs (default: 5 sec)
+- `VISIBILITY_TIMEOUT_SEC` — How long before a claimed job is considered stale (default: 60 sec)
+- `MAX_ATTEMPTS` — Max retries before moving to DLQ (default: 3)
+
+**Monitoring & Recovery:**
+
+- Background **reclaimer thread** runs every 30 seconds; scans `engine:queue:processing` for stale jobs
+- On shutdown (SIGTERM), active job is released back to ready queue (no loss)
+- Failed jobs go to `engine:dead:*` for inspection; never block the queue
 
 Details: [docs/complex-logic.md](docs/complex-logic.md) · HTTP reference: [docs/api-routes.md](docs/api-routes.md) · Plan: [docs/plans/stockfish-queue-live-analysis.plan.md](docs/plans/stockfish-queue-live-analysis.plan.md).
 
@@ -309,7 +374,7 @@ Full reference: [docs/api-routes.md](docs/api-routes.md)
 
 Create `Board-Backend/.env` (copy from [`Board-Backend/.env.example`](Board-Backend/.env.example)). Typical variables:
 
-```
+```bash
 SUPABASE_URL=your_supabase_url
 SUPABASE_KEY=your_supabase_key
 GOOGLE_CLIENT_ID=your_google_client_id
@@ -393,7 +458,7 @@ If you have a Supabase backup (e.g. `db_cluster-13-06-2025@04-25-42.backup (1).g
 That file restores the users and `lichess_users` rows extracted from the backup. **Note:** Lichess access tokens from the backup may be expired; users can re-link their Lichess account in the app.
 
 ### Board-LLM (.env)
-```
+```bash
 HF_API_TOKEN=your_huggingface_token
 DEFAULT_MODEL=mistralai/Mistral-7B-Instruct-v0.3
 ```
